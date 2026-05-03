@@ -1,0 +1,321 @@
+"""
+Apple ID Sign In — ФИНАЛЬНАЯ v5 (самая надёжная)
+"""
+import asyncio
+import logging
+import re
+from typing import Dict, Any
+
+logger = logging.getLogger(__name__)
+
+def normalize_question(text: str) -> str:
+    if not text:
+        return ""
+    text = text.strip()
+    text = re.sub(r'[？?]', '', text)
+    text = re.sub(r'\s+', ' ', text)
+"""
+Apple ID Sign In — ФИНАЛЬНАЯ v5 (самая надёжная)
+"""
+import asyncio
+import logging
+import re
+
+logger = logging.getLogger(__name__)
+
+def normalize_question(text: str) -> str:
+    if not text:
+        return ""
+    text = text.strip()
+    text = re.sub(r'[？?]', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip().lower()
+
+async def fill_security_questions(page, q1_text, q1_answer, q2_text, q2_answer, q3_text, q3_answer, sq_queue=None) -> bool:
+    logger.info("🔄 [v5] НАЧАЛО ЗАПОЛНЕНИЯ КОНТРОЛЬНЫХ ВОПРОСОВ")
+    try:
+        await page.screenshot(path="/tmp/apple_security_before.png")
+        logger.info("📸 Скриншот ДО сохранён → /tmp/apple_security_before.png")
+        await asyncio.sleep(3)
+        inputs = await page.query_selector_all("input[type='text'], input:not([type='hidden']), input")
+        logger.info(f"📍 Найдено полей ввода: {len(inputs)}")
+        if len(inputs) < 2:
+            logger.error("❌ Мало полей ввода")
+            return False
+        questions = []
+        for i, inp in enumerate(inputs[:3]):
+            try:
+                text = ""
+                for sel in ["xpath=./preceding-sibling::label", "xpath=./preceding-sibling::div[contains(@class,'label')]", "xpath=./preceding-sibling::*[contains(text())]"]:
+                    elem = await inp.query_selector(sel)
+                    if elem:
+                        text = (await elem.inner_text()).strip()
+                        break
+                if not text:
+                    parent_text = await inp.evaluate("el => el.parentElement ? el.parentElement.innerText : ''")
+                    text = parent_text.strip()
+                questions.append({"index": i, "text": text, "input": inp})
+                logger.info(f"📝 Вопрос {i+1}: {text[:80]}...")
+            except:
+                questions.append({"index": i, "text": "", "input": inp})
+        configured = {
+            normalize_question(q1_text): q1_answer,
+            normalize_question(q2_text): q2_answer,
+            normalize_question(q3_text): q3_answer
+        }
+        answer_map = {}
+        for q_data in questions:
+            page_clean = normalize_question(q_data["text"])
+            for cfg_q, cfg_a in configured.items():
+                if cfg_q and (cfg_q in page_clean or page_clean in cfg_q):
+                    answer_map[q_data["input"]] = cfg_a
+                    logger.info(f"✅ Совпадение: {q_data['text'][:50]}... → {cfg_a}")
+                    break
+        if len(answer_map) < 2:
+            logger.warning("⚠️ Нет точных совпадений → FALLBACK (по порядку)")
+            answers = [q1_answer, q2_answer, q3_answer]
+            for i, q_data in enumerate(questions[:3]):
+                if q_data["input"] not in answer_map:
+                    answer_map[q_data["input"]] = answers[i]
+                    logger.info(f"🔄 FALLBACK: поле {i+1} ← {answers[i]}")
+        filled = 0
+        for inp, ans in answer_map.items():
+            try:
+                await inp.click()
+                await asyncio.sleep(0.4)
+                await inp.fill(ans)
+                filled += 1
+                logger.info(f"✅ Заполнено поле: {ans}")
+            except Exception as e:
+                logger.error(f"❌ Ошибка заполнения: {e}")
+        if filled < 2:
+            logger.error("❌ Заполнено меньше 2 полей")
+            return False
+        await asyncio.sleep(2)
+        for sel in ["button:has-text('Продолжить')", "button:has-text('Continue')", "button[type='submit']", "button"]:
+            btn = await page.query_selector(sel)
+            if btn:
+                await btn.click()
+                logger.info(f"✅ Кнопка нажата ({sel})")
+                break
+        await asyncio.sleep(3)
+        await page.screenshot(path="/tmp/apple_security_after.png")
+        logger.info("📸 Скриншот ПОСЛЕ сохранён → /tmp/apple_security_after.png")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Критическая ошибка fill_security_questions: {e}")
+        return False
+
+async def get_browser(account_id: int):
+    from playwright.async_api import async_playwright
+    pw = await async_playwright().start()
+    browser = await pw.chromium.launch(headless=True, args=['--no-sandbox'])
+    context = await browser.new_context(locale='ru-RU')
+    return browser, context
+
+async def new_page(ctx):
+    return await ctx.new_page()
+"""
+Apple ID Sign In — ФИНАЛЬНАЯ v5 (самая надёжная)
+"""
+import asyncio
+import logging
+import re
+
+logger = logging.getLogger(__name__)
+
+def normalize_question(text: str) -> str:
+    if not text:
+        return ""
+    text = text.strip()
+    text = re.sub(r'[？?]', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip().lower()
+
+async def fill_security_questions(page, q1_text, q1_answer, q2_text, q2_answer, q3_text, q3_answer, sq_queue=None) -> bool:
+    logger.info("🔄 [v5] НАЧАЛО ЗАПОЛНЕНИЯ КОНТРОЛЬНЫХ ВОПРОСОВ")
+    try:
+        await page.screenshot(path="/tmp/apple_security_before.png")
+        logger.info("📸 Скриншот ДО сохранён → /tmp/apple_security_before.png")
+        await asyncio.sleep(3)
+        inputs = await page.query_selector_all("input[type='text'], input:not([type='hidden']), input")
+        logger.info(f"📍 Найдено полей ввода: {len(inputs)}")
+        if len(inputs) < 2:
+            logger.error("❌ Мало полей ввода")
+            return False
+        questions = []
+        for i, inp in enumerate(inputs[:3]):
+            try:
+                text = ""
+                for sel in ["xpath=./preceding-sibling::label", "xpath=./preceding-sibling::div[contains(@class,'label')]", "xpath=./preceding-sibling::*[contains(text())]"]:
+                    elem = await inp.query_selector(sel)
+                    if elem:
+                        text = (await elem.inner_text()).strip()
+                        break
+                if not text:
+                    parent_text = await inp.evaluate("el => el.parentElement ? el.parentElement.innerText : ''")
+                    text = parent_text.strip()
+                questions.append({"index": i, "text": text, "input": inp})
+                logger.info(f"📝 Вопрос {i+1}: {text[:80]}...")
+            except:
+                questions.append({"index": i, "text": "", "input": inp})
+        configured = {
+            normalize_question(q1_text): q1_answer,
+            normalize_question(q2_text): q2_answer,
+            normalize_question(q3_text): q3_answer
+        }
+        answer_map = {}
+        for q_data in questions:
+            page_clean = normalize_question(q_data["text"])
+            for cfg_q, cfg_a in configured.items():
+                if cfg_q and (cfg_q in page_clean or page_clean in cfg_q):
+                    answer_map[q_data["input"]] = cfg_a
+                    logger.info(f"✅ Совпадение: {q_data['text'][:50]}... → {cfg_a}")
+                    break
+        if len(answer_map) < 2:
+            logger.warning("⚠️ Нет точных совпадений → FALLBACK (по порядку)")
+            answers = [q1_answer, q2_answer, q3_answer]
+            for i, q_data in enumerate(questions[:3]):
+                if q_data["input"] not in answer_map:
+                    answer_map[q_data["input"]] = answers[i]
+                    logger.info(f"🔄 FALLBACK: поле {i+1} ← {answers[i]}")
+        filled = 0
+        for inp, ans in answer_map.items():
+            try:
+                await inp.click()
+                await asyncio.sleep(0.4)
+                await inp.fill(ans)
+                filled += 1
+                logger.info(f"✅ Заполнено поле: {ans}")
+            except Exception as e:
+                logger.error(f"❌ Ошибка заполнения: {e}")
+        if filled < 2:
+            logger.error("❌ Заполнено меньше 2 полей")
+            return False
+        await asyncio.sleep(2)
+        for sel in ["button:has-text('Продолжить')", "button:has-text('Continue')", "button[type='submit']", "button"]:
+            btn = await page.query_selector(sel)
+            if btn:
+                await btn.click()
+                logger.info(f"✅ Кнопка нажата ({sel})")
+                break
+        await asyncio.sleep(3)
+        await page.screenshot(path="/tmp/apple_security_after.png")
+        logger.info("📸 Скриншот ПОСЛЕ сохранён → /tmp/apple_security_after.png")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Критическая ошибка fill_security_questions: {e}")
+        return False
+
+async def get_browser(account_id: int):
+    from playwright.async_api import async_playwright
+    pw = await async_playwright().start()
+    browser = await pw.chromium.launch(headless=True, args=['--no-sandbox'])
+    context = await browser.new_context(locale='ru-RU')
+    return browser, context
+
+async def new_page(ctx):
+    return await ctx.new_page()    return text.strip().lower()
+
+async def fill_security_questions(page, q1_text, q1_answer, q2_text, q2_answer, q3_text, q3_answer, sq_queue=None) -> bool:
+    logger.info("🔄 [v5] НАЧАЛО ЗАПОЛНЕНИЯ КОНТРОЛЬНЫХ ВОПРОСОВ")
+
+    try:
+        await page.screenshot(path="/tmp/apple_security_before.png")
+        logger.info("📸 Скриншот ДО сохранён → /tmp/apple_security_before.png")
+
+        await asyncio.sleep(3)
+
+        inputs = await page.query_selector_all("input[type='text'], input:not([type='hidden']), input")
+        logger.info(f"📍 Найдено полей ввода: {len(inputs)}")
+
+        if len(inputs) < 2:
+            logger.error("❌ Мало полей ввода")
+            return False
+
+        questions = []
+        for i, inp in enumerate(inputs[:3]):
+            try:
+                text = ""
+                for sel in [
+                    "xpath=./preceding-sibling::label",
+                    "xpath=./preceding-sibling::div[contains(@class,'label')]",
+                    "xpath=./preceding-sibling::*[contains(text())]"
+                ]:
+                    elem = await inp.query_selector(sel)
+                    if elem:
+                        text = (await elem.inner_text()).strip()
+                        break
+                if not text:
+                    parent_text = await inp.evaluate("el => el.parentElement ? el.parentElement.innerText : ''")
+                    text = parent_text.strip()
+                questions.append({"index": i, "text": text, "input": inp})
+                logger.info(f"📝 Вопрос {i+1}: {text[:80]}...")
+            except:
+                questions.append({"index": i, "text": "", "input": inp})
+
+        configured = {
+            normalize_question(q1_text): q1_answer,
+            normalize_question(q2_text): q2_answer,
+            normalize_question(q3_text): q3_answer
+        }
+
+        answer_map = {}
+        for q_data in questions:
+            page_clean = normalize_question(q_data["text"])
+            for cfg_q, cfg_a in configured.items():
+                if cfg_q and (cfg_q in page_clean or page_clean in cfg_q):
+                    answer_map[q_data["input"]] = cfg_a
+                    logger.info(f"✅ Совпадение: {q_data['text'][:50]}... → {cfg_a}")
+                    break
+
+        if len(answer_map) < 2:
+            logger.warning("⚠️ Нет точных совпадений → FALLBACK (по порядку)")
+            answers = [q1_answer, q2_answer, q3_answer]
+            for i, q_data in enumerate(questions[:3]):
+                if q_data["input"] not in answer_map:
+                    answer_map[q_data["input"]] = answers[i]
+                    logger.info(f"🔄 FALLBACK: поле {i+1} ← {answers[i]}")
+
+        filled = 0
+        for inp, ans in answer_map.items():
+            try:
+                await inp.click()
+                await asyncio.sleep(0.4)
+                await inp.fill(ans)
+                filled += 1
+                logger.info(f"✅ Заполнено поле: {ans}")
+            except Exception as e:
+                logger.error(f"❌ Ошибка заполнения: {e}")
+
+        if filled < 2:
+            logger.error("❌ Заполнено меньше 2 полей")
+            return False
+
+        await asyncio.sleep(2)
+        for sel in ["button:has-text('Продолжить')", "button:has-text('Continue')", "button[type='submit']", "button"]:
+            btn = await page.query_selector(sel)
+            if btn:
+                await btn.click()
+                logger.info(f"✅ Кнопка нажата ({sel})")
+                break
+
+        await asyncio.sleep(3)
+        await page.screenshot(path="/tmp/apple_security_after.png")
+        logger.info("📸 Скриншот ПОСЛЕ сохранён → /tmp/apple_security_after.png")
+
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Критическая ошибка fill_security_questions: {e}")
+        return False
+
+async def get_browser(account_id: int):
+    from playwright.async_api import async_playwright
+    pw = await async_playwright().start()
+    browser = await pw.chromium.launch(headless=True, args=['--no-sandbox'])
+    context = await browser.new_context(locale='ru-RU')
+    return browser, context
+
+async def new_page(ctx):
+    return await ctx.new_page()

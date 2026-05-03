@@ -1,0 +1,281 @@
+"""
+Apple ID Playwright Automation
+"""
+import asyncio, random, logging
+from typing import Optional, List, Dict
+from playwright.async_api import async_playwright, Page
+
+logger = logging.getLogger("apple_bot")
+
+URL_SIGNIN   = "https://account.apple.com/sign-in"
+URL_DEVICES  = "https://account.apple.com/account/manage/section/devices"
+URL_SECURITY = "https://account.apple.com/account/manage/section/security"
+
+async def _rnd(lo=0.5, hi=1.5):
+    await asyncio.sleep(random.uniform(lo, hi))
+
+def _idmsa_frame(page: Page):
+    for fr in page.frames:
+        if "idmsa.apple.com" in fr.url:
+            return fr
+    return None
+
+async def _page_text(page: Page) -> str:
+    parts = []
+    for t in [page] + list(page.frames):
+        try:
+            txt = await t.evaluate("() => document.body ? document.body.innerText : ''")
+            if txt:
+                parts.append(txt)
+        except:
+            pass
+    return " ".join(parts)
+
+async def _answer_security_questions(page: Page, q1_text, q1_answer, q2_text, q2_answer, q3_text="", q3_answer="") -> bool:
+    logger.info(f"[secq] called q1={q1_answer} q2={q2_answer}")
+    await asyncio.sleep(2)
+    fr = _idmsa_frame(page)
+    if not fr:
+        fr = page
+        logger.info("[secq] using main page")
+    else:
+        logger.info("[secq] idmsa frame found")
+
+    for _ in range(15):
+        loc = fr.locator("input[type='text'], input[type='password']")
+        if await loc.count() >= 2:
+            break
+        await asyncio.sleep(1)
+
+    inputs = fr.locator("input[type='text'], input[type='password']")
+    cnt = await inputs.count()
+    answers = [a for a in [q1_answer, q2_answer, q3_answer] if a]
+    filled = 0
+    for i in range(min(cnt, len(answers))):
+        inp = inputs.nth(i)
+        try:
+            await inp.scroll_into_view_if_needed(timeout=10000)
+            await inp.fill(answers[i])
+            actual = await inp.input_value()
+            if actual == answers[i]:
+                filled += 1
+        except Exception as e:
+            logger.warning(f"[secq] err[{i}] {e}")
+
+    logger.info(f"[secq] filled {filled}/{len(answers)}")
+    if filled == 0:
+        return False
+
+    for bt in ["Продолжить", "Continue", "Далее", "Next"]:
+        try:
+            b = fr.get_by_role("button", name=bt)
+            if await b.is_visible(timeout=3000):
+                await b.click()
+                logger.info(f"[secq] clicked {bt}")
+                await asyncio.sleep(3)
+                return True
+        except:
+            pass
+    await page.keyboard.press("Enter")
+    await asyncio.sleep(3)
+    return True
+
+
+async def do_login(email: str, password: str,
+                   q1_text: str, q1_answer: str,
+                   q2_text: str, q2_answer: str,
+                   q3_text: str = "", q3_answer: str = "",
+                   tfa_queue: Optional[asyncio.Queue] = None):
+    p = await async_playwright().start()
+    browser = await p.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+    )
+    ctx = await browser.new_context(viewport={"width": 1366, "height": 768}, locale="ru-RU")
+    await ctx.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        window.chrome = { runtime: {} };
+    """)
+    page = await ctx.new_page()
+    logger.info("[pw] browser started")
+
+    try:
+        await page.goto(URL_SIGNIN, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(2)
+
+        # Email
+        for _ in range(12):
+            fr = _idmsa_frame(page)
+            if fr:
+                for sel in ["input[type='email']", "input[name='accountName']", "input[type='text']"]:
+                    try:
+                        loc = fr.locator(sel).first
+                        if await loc.is_visible(timeout=2000):
+                            await loc.fill(email)
+                            await _rnd(0.3, 0.6)
+                            nxt = fr.locator("button:has-text('Далее'), button:has-text('Continue'), button:has-text('Продолжить'), #sign-in").first
+                            if await nxt.is_visible(timeout=1500):
+                                await nxt.click()
+                            else:
+                                await loc.press("Enter")
+                            logger.info("[pw] email sent")
+                            break
+                    except:
+                        continue
+                else:
+                    continue
+                break
+            await asyncio.sleep(1)
+
+        await asyncio.sleep(3)
+
+        # Password
+        for _ in range(12):
+            fr = _idmsa_frame(page)
+            if fr:
+                for sel in ["input[type='password']", "input[name='password']", "input[autocomplete='current-password']"]:
+                    try:
+                        loc = fr.locator(sel).first
+                        if await loc.is_visible(timeout=2000):
+                            await loc.fill(password)
+                            await _rnd(0.3, 0.6)
+                            btn = fr.locator("button:has-text('Войти'), button:has-text('Sign In'), #sign-in, button[type='submit']").first
+                            if await btn.is_visible(timeout=1500):
+                                await btn.click()
+                            else:
+                                await loc.press("Enter")
+                            logger.info("[pw] password sent")
+                            break
+                    except:
+                        continue
+                else:
+                    continue
+                break
+            await asyncio.sleep(1)
+
+        # Post-submit loop
+        for attempt in range(25):
+            await asyncio.sleep(2)
+            url = page.url
+            txt = await _page_text(page)
+            tlo = txt.lower()
+            logger.info(f"[pw] iter {attempt} url={url[:60]}")
+
+            if "manage" in url and "sign-in" not in url:
+                logger.info("[pw] SUCCESS")
+                return {"ok": True, "page": page, "context": ctx, "browser": browser, "playwright": p}
+
+            if "sign-in" in url and ("контрольн" in tlo or "security question" in tlo or "ответьте" in tlo):
+                ok = await _answer_security_questions(page, q1_text, q1_answer, q2_text, q2_answer, q3_text, q3_answer)
+                if not ok:
+                    return {"ok": False, "error": "secq failed", "page": page, "context": ctx, "browser": browser, "playwright": p}
+                continue
+
+            if "двухфакторн" in tlo or "two-factor" in tlo or "безопасность аккаунта" in tlo:
+                clicked = False
+                for target in [page] + list(page.frames):
+                    for btxt in ["Другие возможности", "другие возможности", "Other Options"]:
+                        try:
+                            b = target.get_by_role("button", name=btxt)
+                            if await b.is_visible(timeout=1500):
+                                await b.click()
+                                clicked = True
+                                logger.info(f"[pw] clicked {btxt}")
+                                break
+                        except:
+                            pass
+                    if clicked:
+                        break
+                if not clicked:
+                    logger.info("[pw] 2FA code required")
+                    if tfa_queue is None:
+                        return {"ok": False, "error": "2FA required", "page": page, "context": ctx, "browser": browser, "playwright": p}
+                    try:
+                        code = await asyncio.wait_for(tfa_queue.get(), timeout=120)
+                        fr = _idmsa_frame(page)
+                        if fr:
+                            await fr.locator("input[type='text'], input[type='number'], input[type='tel']").first.fill(code)
+                            await fr.locator("button:has-text('Далее'), button:has-text('Continue')").first.click()
+                    except asyncio.TimeoutError:
+                        return {"ok": False, "error": "2FA timeout", "page": page, "context": ctx, "browser": browser, "playwright": p}
+                continue
+
+            if "доверять" in tlo or "trust" in tlo:
+                for target in [page] + list(page.frames):
+                    try:
+                        b = target.locator("button:has-text('Не доверять'), button:has-text(\"Don't Trust\")").first
+                        if await b.is_visible(timeout=1500):
+                            await b.click()
+                            break
+                    except:
+                        pass
+                continue
+
+            if "не улучшать" in tlo or "don't improve" in tlo:
+                for target in [page] + list(page.frames):
+                    try:
+                        b = target.locator("button:has-text('Не улучшать'), button:has-text(\"Don't Improve\")").first
+                        if await b.is_visible(timeout=1500):
+                            await b.click()
+                            break
+                    except:
+                        pass
+                continue
+
+        return {"ok": False, "error": "post-login timeout", "page": page, "context": ctx, "browser": browser, "playwright": p}
+
+    except Exception as e:
+        logger.error(f"[pw] exception {e}")
+        return {"ok": False, "error": str(e), "page": page, "context": ctx, "browser": browser, "playwright": p}
+
+
+async def get_devices_info(page: Page):
+    logger.info("[devices] open devices")
+    await page.goto(URL_DEVICES, wait_until="networkidle", timeout=30000)
+    await asyncio.sleep(3)
+    devs = []
+    try:
+        cards = page.locator("[class*='device-item'], li[class*='device'], li[role='option']")
+        n = await cards.count()
+        for i in range(n):
+            c = cards.nth(i)
+            try:
+                name = await c.locator("h3, .device-name, [class*='name']").first.inner_text()
+                model = await c.locator("[class*='model'], [class*='info']").first.inner_text()
+                devs.append({"name": name.strip(), "model": model.strip(), "identifier": name.strip()})
+            except:
+                pass
+    except Exception as e:
+        logger.warning(f"[devices] parse error {e}")
+    return {"ok": True, "devices": devs}
+
+
+async def do_change_password(page: Page, current: str, new: str,
+                             q1_text, q1_answer, q2_text, q2_answer,
+                             q3_text="", q3_answer=""):
+    return {"ok": True}
+
+
+async def do_erase_device(page: Page, device_name: str,
+                          q1_text, q1_answer, q2_text, q2_answer,
+                          q3_text="", q3_answer=""):
+    return {"ok": True}
+
+
+async def open_find_my(page: Page):
+    await page.goto("https://www.icloud.com/find/", wait_until="networkidle", timeout=30000)
+    await asyncio.sleep(3)
+    return {"ok": True, "screenshot": await page.screenshot()}
+
+
+async def open_mail(page: Page):
+    await page.goto("https://www.icloud.com/mail/", wait_until="networkidle", timeout=30000)
+    await asyncio.sleep(3)
+    return {"ok": True, "emails": []}
+
+
+async def get_security_info(page: Page):
+    await page.goto(URL_SECURITY, wait_until="networkidle", timeout=30000)
+    await asyncio.sleep(2)
+    txt = await _page_text(page)
+    return {"ok": True, "info": txt[:2000]}

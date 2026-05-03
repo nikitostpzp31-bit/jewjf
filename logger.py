@@ -1,43 +1,17 @@
-"""
-Логгер на базе loguru. Пишет в файл и stdout.
-"""
+import logging
 import sys
-from pathlib import Path
 
-from loguru import logger as _logger
-
-from config import LOG_PATH, LOG_LEVEL, LOG_FORMAT, LOG_MAX_SIZE, LOG_BACKUP_COUNT
-
-_configured = False
-
-def _configure() -> None:
-    global _configured
-    if _configured:
-        return
-    
-    # Создаём директорию для логов, если её нет
-    Path(LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
-    
-    _logger.remove()
-    _logger.add(sys.stdout, colorize=True, format=LOG_FORMAT, level=LOG_LEVEL)
-    _logger.add(
-        LOG_PATH,
-        rotation=LOG_MAX_SIZE,  # Размер в байтах для ротации
-        retention=LOG_BACKUP_COUNT,  # Количество файлов для сохранения
-        encoding="utf-8",
-        format=LOG_FORMAT,
-        level=LOG_LEVEL,
+def setup_logger():
+    logger = logging.getLogger("apple_bot")
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
     )
-    _configured = True
-
-def get_logger():
-    _configure()
-    return _logger
-
-def get_log_tail(n: int = 50) -> str:
-    """Возвращает последние n строк лог-файла."""
-    p = Path(LOG_PATH)
-    if not p.exists():
-        return "(лог пуст)"
-    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
-    return "\n".join(lines[-n:])
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+    fh = logging.FileHandler("bot.log", encoding="utf-8")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    return logger

@@ -1,12 +1,6 @@
-.env
-*.db
-*.log
 __pycache__/
 *.pyc
-sessions/
-pw_sessions/
-backups/
-exports/
-screenshots/
-venv/
-.venv/
+*.pyo
+bot.log
+bot_data.db
+.env

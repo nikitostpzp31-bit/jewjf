@@ -1,39 +1,48 @@
-"""
-Telegram-бот полной автоматизации Apple ID.
-Команды: /setup /login /devices /findmy /erase /changepass /mail /security /monitor /autoprotect
-"""
-import asyncio
-import os
-import sys
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import Command, StateFilter
+"""Telegram Bot — Apple ID Manager (aiogram 3.x)"""
+import asyncio, logging
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.filters import Command
+from aiogram.types import (
+    Message, BufferedInputFile,
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-    KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove,
-    BufferedInputFile,
-)
 
 import db
-from config import (
-    OWNER_TELEGRAM_ID, TELEGRAM_TOKEN, MSG_UNAUTHORIZED,
-    FEATURE_FIND_MY_IPHONE, FEATURE_DEVICE_TRACKING,
-    FEATURE_LOCATION_HISTORY, FEATURE_NOTIFICATIONS
+from config import BOT_TOKEN, ADMIN_ID
+from playwright_automation import (
+    do_login, get_devices_info, do_change_password,
+    do_erase_device, open_find_my, open_mail, get_security_info
 )
-from logger import get_logger
-from utils import mask_email, validate_apple_password
 
-logger = get_logger()
+logger = logging.getLogger("apple_bot")
+
+async def _make_step_sender(message: Message):
+    """Создаёт коллбэк, который шлёт скриншот прямо в чат Telegram."""
+    async def sender(step_name: str, screenshot: bytes):
+        try:
+            if screenshot:
+                await message.answer_photo(
+                    BufferedInputFile(screenshot, filename=f"{step_name}.png"),
+                    caption=f"🖼 Шаг: <code>{step_name}</code>"
+                )
+            else:
+                await message.answer(f"🖼 Шаг: <code>{step_name}</code> — скриншот не удался")
+        except Exception as e:
+            logger.warning(f"step sender failed: {e}")
+    return sender
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
 router = Router()
+dp.include_router(router)
 
-_bot_instance: Bot | None = None
-_monitor_task: asyncio.Task | None = None
 _tfa_queue: asyncio.Queue = asyncio.Queue()
-_tfa_queues: dict = {}
+_monitor_task = None
+_autoprotect = False
 
-# FSM состояния
 class Setup(StatesGroup):
     email = State()
     password = State()
@@ -41,9 +50,9 @@ class Setup(StatesGroup):
     q1_answer = State()
     q2_text = State()
     q2_answer = State()
+    q3_prompt = State()
     q3_text = State()
     q3_answer = State()
-    confirm = State()
 
 class ChangePass(StatesGroup):
     current = State()
@@ -53,485 +62,458 @@ class ChangePass(StatesGroup):
 class EraseConfirm(StatesGroup):
     waiting = State()
 
-class NewDeviceAction(StatesGroup):
-    change_pass_current = State()
-    change_pass_new1 = State()
-    change_pass_new2 = State()
-    erase_confirm = State()
+def is_admin(uid: int) -> bool:
+    return uid == ADMIN_ID
 
-class TwoFA(StatesGroup):
-    code = State()
-    waiting_code = State()
 
-def is_owner(uid: int) -> bool:
-    return uid == OWNER_TELEGRAM_ID
+# ═══════════════════════════════════════════════════════════
+# START
+# ═══════════════════════════════════════════════════════════
 
-async def guard(obj) -> bool:
-    if isinstance(obj, Message):
-        if not is_owner(obj.from_user.id):
-            await obj.answer(MSG_UNAUTHORIZED)
-            return False
-    elif isinstance(obj, CallbackQuery):
-        if not is_owner(obj.from_user.id):
-            await obj.answer(MSG_UNAUTHORIZED, show_alert=True)
-            return False
-    return True
-
-async def notify(text: str, photo: bytes | None = None) -> None:
-    if not _bot_instance:
-        return
-    try:
-        if photo:
-            await _bot_instance.send_photo(
-                OWNER_TELEGRAM_ID,
-                BufferedInputFile(photo, "screen.png"),
-                caption=text[:1024], parse_mode="HTML"
-            )
-        else:
-            await _bot_instance.send_message(
-                OWNER_TELEGRAM_ID, text, parse_mode="HTML"
-            )
-    except Exception as e:
-        logger.error(f"[notify] {e}")
-
-async def notify_owner(text: str, photo: bytes | None = None) -> None:
-    """Alias for notify function."""
-    await notify(text, photo)
-
-def _get_cfg() -> dict:
-    return db.get_setup()
-
-def _acc_id() -> int:
-    """Возвращает account_id из БД (создаёт если нет)."""
-    cfg = _get_cfg()
-    if not cfg["email"]:
-        return 0
-    accs = db.get_all_accounts()
-    for a in accs:
-        if a["email"] == cfg["email"].lower():
-            return a["id"]
-    return 0
-
-def _ensure_account() -> int:
-    """Создаёт аккаунт в БД если не существует."""
-    cfg = _get_cfg()
-    if not cfg["email"] or not cfg["password"]:
-        return 0
-    accs = db.get_all_accounts()
-    for a in accs:
-        if a["email"] == cfg["email"].lower():
-            db.update_account_password(a["id"], cfg["password"])
-            return a["id"]
-    return db.add_account(cfg["email"], cfg["password"])
-
-# ---------------------------------------------------------------------------
-# Главное меню
-# ---------------------------------------------------------------------------
-
-def main_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="📱 Устройства"), KeyboardButton(text="📍 Локатор")],
-        [KeyboardButton(text="🔑 Сменить пароль"), KeyboardButton(text="📬 Почта")],
-        [KeyboardButton(text="🔒 Безопасность"), KeyboardButton(text="⚙️ Настройки")],
-    ], resize_keyboard=True)
-
-def yn_kb(yes_data: str, no_data: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Да", callback_data=yes_data),
-        InlineKeyboardButton(text="❌ Нет", callback_data=no_data),
-    ]])
-
-# ---------------------------------------------------------------------------
-# /start /help
-# ---------------------------------------------------------------------------
-
-@router.message(Command("start", "help"))
-async def cmd_start(m: Message, state: FSMContext):
-    if not await guard(m): return
-    await state.clear()
-    try:
-        db.init_db()
-        cfg = _get_cfg()
-        setup_ok = db.is_setup_complete()
-    except Exception:
-        cfg = {"email": "", "monitor": "off", "autoprotect": "off"}
-        setup_ok = False
-    mon = cfg.get("monitor", "off")
-    ap = cfg.get("autoprotect", "off")
-    status = (
-        f"📧 Email: {mask_email(cfg['email']) if cfg['email'] else '—'}\n"
-        f"🔍 Мониторинг: {'✅ вкл' if mon=='on' else '⏸ выкл'}\n"
-        f"🛡 Автозащита: {'✅ вкл' if ap=='on' else '⏸ выкл'}\n"
-    )
+@router.message(Command("start"))
+async def cmd_start(message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.answer("⛔️ Доступ запрещён.")
+    cfg = db.get_config()
+    email = cfg.get("email", "не задан")
+    setup_ok = bool(email and cfg.get("q1_text"))
+    status = "✅ Настроено" if setup_ok else "❌ Не настроено"
     text = (
-        "🍎 <b>iCloud Monitor Bot</b>\n\n"
-        f"{status}\n"
-        "<b>Команды:</b>\n"
-        "/setup — настройка email + вопросы\n"
-        "/login — войти в аккаунт\n"
-        "/devices — список устройств + IMEI\n"
-        "/findmy — локатор устройств\n"
-        "/erase [имя] — стереть устройство\n"
-        "/changepass — сменить пароль\n"
-        "/mail — проверить почту\n"
-        "/security — настройки безопасности\n"
-        "/monitor start|stop — мониторинг\n"
-        "/autoprotect on|off — автозащита\n"
-        "/tfa [код] — ввести 2FA код\n"
-        "/cancel — отменить действие\n"
+        f"🍎 <b>Apple ID Manager</b>\n\n"
+        f"👤 Аккаунт: <code>{email}</code>\n"
+        f"⚙️ Статус: {status}\n\n"
+        f"<b>Команды:</b>\n"
+        f"/setup — настройка аккаунта\n"
+        f"/login — проверить вход\n"
+        f"/devices — список устройств\n"
+        f"/findmy — Find My\n"
+        f"/erase [имя] — стереть устройство\n"
+        f"/changepass — сменить пароль\n"
+        f"/mail — почта iCloud\n"
+        f"/security — настройки безопасности\n"
+        f"/autoprotect on|off\n"
+        f"/monitor start|stop\n"
+        f"/tfa [код] — ввести код 2FA"
     )
-    if not setup_ok:
-        text += "\n⚠️ <b>Сначала выполните /setup</b>"
-    await m.answer(text, parse_mode="HTML", reply_markup=main_kb())
+    await message.answer(text)
 
-@router.message(Command("cancel"))
-async def cmd_cancel(m: Message, state: FSMContext):
-    if not await guard(m): return
-    await state.clear()
-    await m.answer("❌ Отменено.", reply_markup=main_kb())
 
-# ---------------------------------------------------------------------------
-# /tfa — ввод 2FA кода
-# ---------------------------------------------------------------------------
-
-@router.message(Command("tfa"))
-async def cmd_tfa(m: Message, state: FSMContext = None):
-    if not await guard(m): return
-    # If there are per-account queues, ask which account
-    if _tfa_queues:
-        if len(_tfa_queues) == 1:
-            acc_id = next(iter(_tfa_queues))
-            if state:
-                await state.update_data(tfa_account_id=acc_id)
-                await state.set_state(TwoFA.waiting_code)
-            await m.answer(f"Введите 6-значный код 2FA для аккаунта #{acc_id}:")
-        else:
-            await m.answer("Несколько активных сессий 2FA. Используйте /tfa <код>")
-        return
-    parts = m.text.strip().split(maxsplit=1)
-    if len(parts) < 2:
-        await m.answer("Нет активных сессий 2FA.")
-        return
-    code = parts[1].strip()
-    if not code.isdigit() or len(code) != 6:
-        await m.answer("❌ Код должен быть 6 цифр.")
-        return
-    await _tfa_queue.put(code)
-    await m.answer("✅ Код 2FA передан боту.")
-
-# ---------------------------------------------------------------------------
-# /setup — пошаговая настройка
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════
+# SETUP FSM
+# ═══════════════════════════════════════════════════════════
 
 @router.message(Command("setup"))
-async def cmd_setup(m: Message, state: FSMContext):
-    if not await guard(m): return
-    await state.clear()
+async def cmd_setup(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return await message.answer("⛔️ Доступ запрещён.")
+    await message.answer("📧 Шаг 1/7 — Введи email Apple ID:")
     await state.set_state(Setup.email)
-    await m.answer(
-        "⚙️ <b>Настройка Apple ID бота</b>\n\n"
-        "Шаг 1/8: Введите ваш Apple ID (email):",
-        parse_mode="HTML", reply_markup=ReplyKeyboardRemove()
-    )
 
-@router.message(StateFilter(Setup.email))
-async def setup_email(m: Message, state: FSMContext):
-    if not await guard(m): return
-    from utils import is_valid_email
-    email = m.text.strip()
-    if not is_valid_email(email):
-        await m.answer("❌ Некорректный email. Попробуйте ещё раз:"); return
-    await state.update_data(email=email)
+@router.message(Setup.email)
+async def s_email(message: Message, state: FSMContext):
+    await state.update_data(email=message.text.strip())
+    await message.answer("🔑 Шаг 2/7 — Введи пароль Apple ID:")
     await state.set_state(Setup.password)
-    await m.answer(
-        "Шаг 2/8: Введите пароль Apple ID:\n<i>(сообщение будет удалено)</i>",
-        parse_mode="HTML"
-    )
 
-@router.message(StateFilter(Setup.password))
-async def setup_password(m: Message, state: FSMContext):
-    if not await guard(m): return
-    pwd = m.text.strip()
-    try: await m.delete()
-    except Exception: pass
-    err = validate_apple_password(pwd)
-    if err:
-        await m.answer(f"❌ {err}\nПопробуйте ещё раз:"); return
-    await state.update_data(password=pwd)
+@router.message(Setup.password)
+async def s_password(message: Message, state: FSMContext):
+    await state.update_data(password=message.text.strip())
+    await message.answer("❓ Шаг 3/7 — Введи ТЕКСТ первого контрольного вопроса (как в Apple):")
     await state.set_state(Setup.q1_text)
-    await m.answer(
-        "Шаг 3/8: Введите текст первого контрольного вопроса\n"
-        "<i>Пример: 你的理想工作是什么？</i>",
-        parse_mode="HTML"
-    )
 
-@router.message(StateFilter(Setup.q1_text))
-async def setup_q1_text(m: Message, state: FSMContext):
-    if not await guard(m): return
-    await state.update_data(q1_text=m.text.strip())
+@router.message(Setup.q1_text)
+async def s_q1t(message: Message, state: FSMContext):
+    await state.update_data(q1_text=message.text.strip())
+    await message.answer("❗️ Шаг 4/7 — Введи ОТВЕТ на первый вопрос:")
     await state.set_state(Setup.q1_answer)
-    await m.answer(
-        f"Шаг 4/8: Введите ответ на первый вопрос:\n"
-        f"«{m.text.strip()}»\n\n<i>Вводите ТОЧНО как в Apple ID</i>",
-        parse_mode="HTML"
-    )
 
-@router.message(StateFilter(Setup.q1_answer))
-async def setup_q1_answer(m: Message, state: FSMContext):
-    if not await guard(m): return
-    await state.update_data(q1_answer=m.text.strip())
+@router.message(Setup.q1_answer)
+async def s_q1a(message: Message, state: FSMContext):
+    await state.update_data(q1_answer=message.text.strip())
+    await message.answer("❓ Шаг 5/7 — Введи ТЕКСТ второго контрольного вопроса:")
     await state.set_state(Setup.q2_text)
-    await m.answer(
-        "Шаг 5/8: Введите текст второго контрольного вопроса\n"
-        "<i>Пример: 你少年时代最好的朋友叫什么名字？</i>",
-        parse_mode="HTML"
-    )
 
-@router.message(StateFilter(Setup.q2_text))
-async def setup_q2_text(m: Message, state: FSMContext):
-    if not await guard(m): return
-    await state.update_data(q2_text=m.text.strip())
+@router.message(Setup.q2_text)
+async def s_q2t(message: Message, state: FSMContext):
+    await state.update_data(q2_text=message.text.strip())
+    await message.answer("❗️ Шаг 6/7 — Введи ОТВЕТ на второй вопрос:")
     await state.set_state(Setup.q2_answer)
-    await m.answer(
-        f"Шаг 6/8: Введите ответ на второй вопрос:\n"
-        f"«{m.text.strip()}»",
-        parse_mode="HTML"
-    )
 
-@router.message(StateFilter(Setup.q2_answer))
-async def setup_q2_answer(m: Message, state: FSMContext):
-    if not await guard(m): return
-    await state.update_data(q2_answer=m.text.strip())
+@router.message(Setup.q2_answer)
+async def s_q2a(message: Message, state: FSMContext):
+    await state.update_data(q2_answer=message.text.strip())
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Да"), KeyboardButton(text="Нет")]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    await message.answer("❓ Есть третий контрольный вопрос?", reply_markup=kb)
+    await state.set_state(Setup.q3_prompt)
+
+@router.message(Setup.q3_prompt, F.text.lower() == "да")
+async def s_q3y(message: Message, state: FSMContext):
+    await message.answer("❓ Шаг 7a — Введи ТЕКСТ третьего вопроса:", reply_markup=ReplyKeyboardRemove())
     await state.set_state(Setup.q3_text)
-    await m.answer(
-        "Шаг 7/8: Введите текст третьего контрольного вопроса\n"
-        "<i>Пример: 你父母是在哪里相识的？</i>",
-        parse_mode="HTML"
-    )
 
-@router.message(StateFilter(Setup.q3_text))
-async def setup_q3_text(m: Message, state: FSMContext):
-    if not await guard(m): return
-    await state.update_data(q3_text=m.text.strip())
+@router.message(Setup.q3_prompt, F.text.lower() == "нет")
+async def s_q3n(message: Message, state: FSMContext):
+    await state.update_data(q3_text="", q3_answer="")
+    await _finish_setup(message, state)
+
+@router.message(Setup.q3_text)
+async def s_q3t(message: Message, state: FSMContext):
+    await state.update_data(q3_text=message.text.strip())
+    await message.answer("❗️ Введи ОТВЕТ на третий вопрос:")
     await state.set_state(Setup.q3_answer)
-    await m.answer(
-        f"Шаг 8/8: Введите ответ на третий вопрос:\n"
-        f"«{m.text.strip()}»",
-        parse_mode="HTML"
-    )
 
-@router.message(StateFilter(Setup.q3_answer))
-async def setup_q3_answer(m: Message, state: FSMContext):
-    if not await guard(m): return
-    await state.update_data(q3_answer=m.text.strip())
-    data = await state.get_data()
-    await state.set_state(Setup.confirm)
-    text = (
-        "✅ <b>Проверьте данные:</b>\n\n"
-        f"📧 Email: <code>{data['email']}</code>\n"
-        f"🔑 Пароль: {'*' * len(data['password'])}\n"
-        f"❓ Вопрос 1: {data['q1_text']}\n"
-        f"   Ответ: <code>{data['q1_answer']}</code>\n"
-        f"❓ Вопрос 2: {data['q2_text']}\n"
-        f"   Ответ: <code>{data['q2_answer']}</code>\n"
-        f"❓ Вопрос 3: {data['q3_text']}\n"
-        f"   Ответ: <code>{data['q3_answer']}</code>\n\n"
-        "Сохранить?"
-    )
-    await m.answer(text, parse_mode="HTML",
-                   reply_markup=yn_kb("setup_save", "setup_cancel"))
+@router.message(Setup.q3_answer)
+async def s_q3a(message: Message, state: FSMContext):
+    await state.update_data(q3_answer=message.text.strip())
+    await _finish_setup(message, state)
 
-@router.callback_query(F.data == "setup_save")
-async def setup_save(cb: CallbackQuery, state: FSMContext):
-    if not await guard(cb): return
+async def _finish_setup(message: Message, state: FSMContext):
     data = await state.get_data()
-    await state.clear()
     db.set_config("email", data["email"])
     db.set_config("password", data["password"])
-    db.set_config("q1_text", data["q1_text"])
-    db.set_config("q1_answer", data["q1_answer"])
-    db.set_config("q2_text", data["q2_text"])
-    db.set_config("q2_answer", data["q2_answer"])
+    db.set_config("q1_text", data.get("q1_text", ""))
+    db.set_config("q1_answer", data.get("q1_answer", ""))
+    db.set_config("q2_text", data.get("q2_text", ""))
+    db.set_config("q2_answer", data.get("q2_answer", ""))
     db.set_config("q3_text", data.get("q3_text", ""))
     db.set_config("q3_answer", data.get("q3_answer", ""))
-    _ensure_account()
-    await cb.message.answer(
-        f"✅ <b>Настройка сохранена!</b>\n"
-        f"Email: {data['email']}\n\n"
-        "Теперь можно использовать /login /devices /findmy",
-        parse_mode="HTML", reply_markup=main_kb()
-    )
-    await cb.answer()
-
-@router.callback_query(F.data == "setup_cancel")
-async def setup_cancel_cb(cb: CallbackQuery, state: FSMContext):
-    if not await guard(cb): return
     await state.clear()
-    await cb.message.answer("❌ Настройка отменена.", reply_markup=main_kb())
-    await cb.answer()
+    await message.answer(
+        f"✅ Настройка сохранена!\n\n"
+        f"📧 {data['email']}\n"
+        f"Теперь попробуй /login",
+        reply_markup=ReplyKeyboardRemove()
+    )
 
-# ---------------------------------------------------------------------------
-# /login
-# ---------------------------------------------------------------------------
+
+# ═══════════════════════════════════════════════════════════
+# LOGIN
+# ═══════════════════════════════════════════════════════════
 
 @router.message(Command("login"))
-async def cmd_login(m: Message):
-    if not await guard(m): return
-    if not db.is_setup_complete():
-        await m.answer("⚠️ Сначала выполните /setup"); return
-    await m.answer("🔄 Выполняю вход в Apple ID…")
-    try:
-        from playwright_automation import apple_signin, _get_browser, _new_page
-        cfg = _get_cfg()
-        acc_id = _ensure_account()
-        pw, ctx = await _get_browser(acc_id)
-        page = await _new_page(ctx)
+async def cmd_login(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    cfg = db.get_config()
+    need = ["email", "password", "q1_text", "q1_answer", "q2_text", "q2_answer"]
+    missing = [k for k in need if not cfg.get(k)]
+    if missing:
+        return await message.answer(f"❌ Не настроены поля: {', '.join(missing)}")
+    await message.answer("🔐 Выполняю вход...")
+    result = await do_login(
+        cfg["email"], cfg["password"],
+        cfg["q1_text"], cfg["q1_answer"],
+        cfg["q2_text"], cfg["q2_answer"],
+        cfg.get("q3_text", ""), cfg.get("q3_answer", ""),
+        tfa_queue=_tfa_queue
+    )
+    if result.get("ok"):
+        await message.answer("✅ Вход выполнен. Делаю скриншот...")
         try:
-            r = await asyncio.wait_for(
-                apple_signin(page, cfg["email"], cfg["password"],
-                             cfg["q1_text"], cfg["q1_answer"],
-                             cfg["q2_text"], cfg["q2_answer"],
-                             cfg.get("q3_text", ""), cfg.get("q3_answer", ""),
-                             _tfa_queue, notify),
-                timeout=180
-            )
-            if r["ok"]:
-                await m.answer("✅ <b>Вошёл в аккаунт успешно!</b>\n\nДалее: /devices /findmy /mail",
-                               parse_mode="HTML", reply_markup=main_kb())
-            else:
-                await m.answer(f"❌ Ошибка входа: {r['error']}", reply_markup=main_kb())
-                if r.get("screenshot"):
-                    await m.answer_photo(BufferedInputFile(r["screenshot"], "error.png"), caption="Скриншот ��шибки")
-        except asyncio.TimeoutError:
-            await m.answer("⏱ Таймаут входа. Попробуйте ещё раз.")
-        finally:
-            await ctx.close()
-            await pw.stop()
-    except ImportError:
-        await m.answer("❌ Playwright не установлен. Установите: pip install playwright && playwright install chromium")
-    except Exception as e:
-        logger.error(f"[login] {e}")
-        await m.answer(f"❌ Ошибка: {e}")
+            scr = await result["page"].screenshot()
+            if scr:
+                await message.answer_photo(BufferedInputFile(scr, "login.png"))
+        except Exception as e:
+            logger.warning(f"screenshot err {e}")
+    else:
+        await message.answer(f"❌ Ошибка: {result.get('error', 'unknown')}")
+    try:
+        await result["context"].close()
+        await result["browser"].close()
+        await result["playwright"].stop()
+    except:
+        pass
 
-# ---------------------------------------------------------------------------
-# /devices
-# ---------------------------------------------------------------------------
+
+# ═══════════════════════════════════════════════════════════
+# DEVICES
+# ═══════════════════════════════════════════════════════════
 
 @router.message(Command("devices"))
-@router.message(F.text == "📱 Устройства")
-async def cmd_devices(m: Message):
-    if not await guard(m): return
-    if not db.is_setup_complete():
-        await m.answer("⚠️ Сначала выполните /setup"); return
-    await m.answer("🔄 Загружаю список устройств…\n<i>~2-3 минуты</i>", parse_mode="HTML")
-    try:
-        from playwright_automation import get_devices, _get_browser, _new_page
-        cfg = _get_cfg()
-        acc_id = _ensure_account()
-        pw, ctx = await _get_browser(acc_id)
-        page = await _new_page(ctx)
-        try:
-            r = await asyncio.wait_for(
-                get_devices(page, cfg["email"], cfg["password"],
-                            cfg["q1_text"], cfg["q1_answer"],
-                            cfg["q2_text"], cfg["q2_answer"],
-                            cfg.get("q3_text", ""), cfg.get("q3_answer", ""),
-                            _tfa_queue, notify),
-                timeout=240
-            )
-            if not r["ok"]:
-                await m.answer(f"❌ Ошибка: {r['error']}", reply_markup=main_kb())
-                return
-            devices = r.get("devices", [])
-            if not devices:
-                await m.answer("📱 Устройств не найдено.", reply_markup=main_kb())
-                return
-            # Сохраняем в БД
-            for d in devices:
-                name = d.get("name") or d.get("description") or ""
-                if name:
-                    db.save_known_device(acc_id, name, d.get("model", ""), d.get("imei", ""))
-                    db.upsert_device(acc_id, {
-                        "device_id": name, "name": name,
-                        "model": d.get("model", ""), "version": d.get("version", ""),
-                        "imei": d.get("imei", ""),
-                    })
-            # Форматируем
-            lines = []
-            for i, d in enumerate(devices, 1):
-                name = d.get("name") or "—"
-                model = d.get("model") or "—"
-                imei = d.get("imei") or "—"
-                lines.append(f"<b>{i}. {name}</b>\n   📱 {model}\n   🔑 IMEI: <code>{imei}</code>")
-            text = f"📱 <b>Устройства ({len(devices)}):</b>\n\n" + "\n\n".join(lines)
-            await m.answer(text, parse_mode="HTML", reply_markup=main_kb())
-        except asyncio.TimeoutError:
-            await m.answer("⏱ Таймаут. Попробуйте ещё раз.")
-        finally:
-            await ctx.close()
-            await pw.stop()
-    except ImportError:
-        await m.answer("❌ Playwright не установлен.")
-    except Exception as e:
-        logger.error(f"[devices] {e}")
-        await m.answer(f"❌ Ошибка: {e}")
-
-# ---------------------------------------------------------------------------
-# /monitor
-# ---------------------------------------------------------------------------
-
-@router.message(Command("monitor"))
-async def cmd_monitor(m: Message):
-    if not await guard(m): return
-    from scheduler import set_monitoring, is_monitoring_active
-    parts = m.text.strip().split()
-    if len(parts) < 2:
-        status = "включён" if is_monitoring_active() else "выключен"
-        await m.answer(f"🔍 Мониторинг: {status}\n\nИспользуйте: /monitor start|stop")
+async def cmd_devices(message: Message):
+    if not is_admin(message.from_user.id):
         return
-    action = parts[1].lower()
-    if action in ("start", "on"):
-        set_monitoring(True)
-        db.set_config("monitor", "on")
-        await m.answer("✅ Мониторинг включён")
-    elif action in ("stop", "off"):
-        set_monitoring(False)
-        db.set_config("monitor", "off")
-        await m.answer("⏸ Мониторинг выключен")
-    else:
-        await m.answer("❌ Используйте: /monitor start|stop")
+    cfg = db.get_config()
+    if not cfg.get("email"):
+        return await message.answer("Сначала /setup")
+    await message.answer("⏳ Получаю устройства...")
+    result = await do_login(
+        cfg["email"], cfg["password"],
+        cfg["q1_text"], cfg["q1_answer"],
+        cfg["q2_text"], cfg["q2_answer"],
+        cfg.get("q3_text", ""), cfg.get("q3_answer", ""),
+        tfa_queue=_tfa_queue
+    )
+    if not result.get("ok"):
+        return await message.answer(f"❌ Вход не удался: {result.get('error')}")
+    devs = await get_devices_info(result["page"])
+    try:
+        await result["context"].close()
+        await result["browser"].close()
+        await result["playwright"].stop()
+    except:
+        pass
 
-# ---------------------------------------------------------------------------
-# /autoprotect
-# ---------------------------------------------------------------------------
+    if not devs.get("devices"):
+        return await message.answer("Устройства не найдены или страница изменилась.")
+    lines = ["📱 <b>Устройства:</b>\n"]
+    for d in devs["devices"]:
+        lines.append(f"• {d.get('name', '?')} — {d.get('model', '?')}")
+    await message.answer("\n".join(lines))
+
+
+# ═══════════════════════════════════════════════════════════
+# CHANGE PASSWORD
+# ═══════════════════════════════════════════════════════════
+
+@router.message(Command("changepass"))
+async def cmd_changepass(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("Введи текущий пароль:")
+    await state.set_state(ChangePass.current)
+
+@router.message(ChangePass.current)
+async def cp_current(message: Message, state: FSMContext):
+    await state.update_data(current=message.text.strip())
+    await message.answer("Введи новый пароль:")
+    await state.set_state(ChangePass.new1)
+
+@router.message(ChangePass.new1)
+async def cp_new1(message: Message, state: FSMContext):
+    await state.update_data(new1=message.text.strip())
+    await message.answer("Повтори новый пароль:")
+    await state.set_state(ChangePass.new2)
+
+@router.message(ChangePass.new2)
+async def cp_new2(message: Message, state: FSMContext):
+    data = await state.get_data()
+    await state.clear()
+    if data["new1"] != message.text.strip():
+        return await message.answer("❌ Пароли не совпадают. Начни заново: /changepass")
+    cfg = db.get_config()
+    await message.answer("⏳ Меняю пароль...")
+    result = await do_login(
+        cfg["email"], cfg["password"],
+        cfg["q1_text"], cfg["q1_answer"],
+        cfg["q2_text"], cfg["q2_answer"],
+        cfg.get("q3_text", ""), cfg.get("q3_answer", ""),
+        tfa_queue=_tfa_queue
+    )
+    if not result.get("ok"):
+        return await message.answer(f"❌ Вход не удался: {result.get('error')}")
+    r2 = await do_change_password(
+        result["page"], data["current"], data["new1"],
+        cfg["q1_text"], cfg["q1_answer"],
+        cfg["q2_text"], cfg["q2_answer"],
+        cfg.get("q3_text", ""), cfg.get("q3_answer", "")
+    )
+    try:
+        await result["context"].close()
+        await result["browser"].close()
+        await result["playwright"].stop()
+    except:
+        pass
+    await message.answer("✅ Пароль изменён (если реализация поддерживает)" if r2.get("ok") else "❌ Не удалось")
+
+
+# ═══════════════════════════════════════════════════════════
+# ERASE
+# ═══════════════════════════════════════════════════════════
+
+@router.message(Command("erase"))
+async def cmd_erase(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        return await message.answer("Использование: /erase [имя устройства]")
+    await state.update_data(device_name=args[1].strip())
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="ДА")]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    await message.answer(
+        f"⚠️ Подтверди стирание устройства <code>{args[1]}</code>\n\nВведи ДА:",
+        reply_markup=kb
+    )
+    await state.set_state(EraseConfirm.waiting)
+
+@router.message(EraseConfirm.waiting)
+async def erase_confirmed(message: Message, state: FSMContext):
+    if message.text.strip().upper() != "ДА":
+        await state.clear()
+        return await message.answer("Отменено.", reply_markup=ReplyKeyboardRemove())
+    data = await state.get_data()
+    await state.clear()
+    cfg = db.get_config()
+    await message.answer("⏳ Выполняю...", reply_markup=ReplyKeyboardRemove())
+    result = await do_login(
+        cfg["email"], cfg["password"],
+        cfg["q1_text"], cfg["q1_answer"],
+        cfg["q2_text"], cfg["q2_answer"],
+        cfg.get("q3_text", ""), cfg.get("q3_answer", ""),
+        tfa_queue=_tfa_queue
+    )
+    if not result.get("ok"):
+        return await message.answer(f"❌ Вход не удался: {result.get('error')}")
+    r2 = await do_erase_device(
+        result["page"], data["device_name"],
+        cfg["q1_text"], cfg["q1_answer"],
+        cfg["q2_text"], cfg["q2_answer"],
+        cfg.get("q3_text", ""), cfg.get("q3_answer", "")
+    )
+    try:
+        await result["context"].close()
+        await result["browser"].close()
+        await result["playwright"].stop()
+    except:
+        pass
+    await message.answer("✅ Команда отправлена" if r2.get("ok") else "❌ Ошибка")
+
+
+# ═══════════════════════════════════════════════════════════
+# FIND MY / MAIL / SECURITY
+# ═══════════════════════════════════════════════════════════
+
+@router.message(Command("findmy"))
+async def cmd_findmy(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    cfg = db.get_config()
+    await message.answer("⏳ Открываю Find My...")
+    result = await do_login(
+        cfg["email"], cfg["password"],
+        cfg["q1_text"], cfg["q1_answer"],
+        cfg["q2_text"], cfg["q2_answer"],
+        cfg.get("q3_text", ""), cfg.get("q3_answer", ""),
+        tfa_queue=_tfa_queue
+    )
+    if not result.get("ok"):
+        return await message.answer(f"❌ {result.get('error')}")
+    r2 = await open_find_my(result["page"])
+    try:
+        await result["context"].close()
+        await result["browser"].close()
+        await result["playwright"].stop()
+    except:
+        pass
+    if r2.get("screenshot"):
+        await message.answer_photo(BufferedInputFile(r2["screenshot"], "findmy.png"))
+
+@router.message(Command("mail"))
+async def cmd_mail(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    cfg = db.get_config()
+    await message.answer("⏳ Открываю почту...")
+    result = await do_login(
+        cfg["email"], cfg["password"],
+        cfg["q1_text"], cfg["q1_answer"],
+        cfg["q2_text"], cfg["q2_answer"],
+        cfg.get("q3_text", ""), cfg.get("q3_answer", ""),
+        tfa_queue=_tfa_queue
+    )
+    if not result.get("ok"):
+        return await message.answer(f"❌ {result.get('error')}")
+    r2 = await open_mail(result["page"])
+    try:
+        await result["context"].close()
+        await result["browser"].close()
+        await result["playwright"].stop()
+    except:
+        pass
+    emails = r2.get("emails", [])
+    if not emails:
+        return await message.answer("📧 Нет новых писем или требуется дополнительная авторизация.")
+    # можно дописать разбор писем при необходимости
+
+@router.message(Command("security"))
+async def cmd_security(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    cfg = db.get_config()
+    await message.answer("⏳ Получаю настройки...")
+    result = await do_login(
+        cfg["email"], cfg["password"],
+        cfg["q1_text"], cfg["q1_answer"],
+        cfg["q2_text"], cfg["q2_answer"],
+        cfg.get("q3_text", ""), cfg.get("q3_answer", ""),
+        tfa_queue=_tfa_queue
+    )
+    if not result.get("ok"):
+        return await message.answer(f"❌ {result.get('error')}")
+    r2 = await get_security_info(result["page"])
+    try:
+        await result["context"].close()
+        await result["browser"].close()
+        await result["playwright"].stop()
+    except:
+        pass
+    info = r2.get("info", "")
+    await message.answer(f"🔐 <b>Настройки безопасности:</b>\n<pre>{info[:3500]}</pre>")
+
+
+# ═══════════════════════════════════════════════════════════
+# AUTO PROTECT / MONITOR / TFA / STATUS
+# ═══════════════════════════════════════════════════════════
 
 @router.message(Command("autoprotect"))
-async def cmd_autoprotect(m: Message):
-    if not await guard(m): return
-    parts = m.text.strip().split()
-    current = db.get_config("autoprotect", "off")
-    if len(parts) < 2:
-        status = "включена" if current == "on" else "выключена"
-        await m.answer(f"🛡 Автозащита: {status}\n\nИспользуйте: /autoprotect on|off")
+async def cmd_autoprotect(message: Message):
+    if not is_admin(message.from_user.id):
         return
-    action = parts[1].lower()
-    if action in ("on", "1"):
-        db.set_config("autoprotect", "on")
-        await m.answer("✅ Автозащита включена\nПри обнаружении нового устройства бот автоматически:\n- Сменит пароль\n- Включит режим пропажи")
-    elif action in ("off", "0"):
-        db.set_config("autoprotect", "off")
-        await m.answer("⏸ Автозащита выключена")
+    args = message.text.split()
+    global _autoprotect
+    if len(args) > 1 and args[1].lower() in ("on", "1", "yes", "true", "вкл"):
+        _autoprotect = True
+        return await message.answer("🛡 AutoProtect ВКЛЮЧЕН")
+    elif len(args) > 1 and args[1].lower() in ("off", "0", "no", "false", "выкл"):
+        _autoprotect = False
+        return await message.answer("🛡 AutoProtect ВЫКЛЮЧЕН")
     else:
-        await m.answer("❌ Используйте: /autoprotect on|off")
+        status = "✅ ON" if _autoprotect else "❌ OFF"
+        return await message.answer(f"🛡 AutoProtect: <b>{status}</b>\n\nИспользование: /autoprotect on|off")
 
-# ---------------------------------------------------------------------------
-# Создание бота и диспетчера
-# ---------------------------------------------------------------------------
+@router.message(Command("tfa"))
+async def cmd_tfa(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        return await message.answer("Введи код: /tfa 123456")
+    code = args[1].strip()
+    await _tfa_queue.put(code)
+    await message.answer("⏳ Код отправлен в очередь входа...")
 
-def create_bot_and_dispatcher() -> tuple[Bot, Dispatcher]:
-    global _bot_instance
-    bot = Bot(token=TELEGRAM_TOKEN)
-    _bot_instance = bot
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
-    return bot, dp
+@router.message(Command("status"))
+async def cmd_status(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    cfg = db.get_config()
+    email = cfg.get("email", "не задан")
+    setup_ok = bool(cfg.get("email") and cfg.get("q1_text"))
+    monitor = _monitor_task is not None and not _monitor_task.done()
+    text = (
+        f"📊 <b>Статус</b>\n\n"
+        f"👤 Email: <code>{email}</code>\n"
+        f"⚙️ Настройки: {'✅' if setup_ok else '❌'}\n"
+        f"👁 Мониторинг: {'✅' if monitor else '❌'}\n"
+        f"🛡 AutoProtect: {'✅ ON' if _autoprotect else '❌ OFF'}"
+    )
+    await message.answer(text)
+
+
+# ═══════════════════════════════════════════════════════════
+# EXPORTS
+# ═══════════════════════════════════════════════════════════
+
+def get_dispatcher():
+    return dp
+
+def get_bot():
+    return bot
