@@ -17,7 +17,11 @@ from aiogram.types import (
 )
 
 import db
-from config import OWNER_TELEGRAM_ID, TELEGRAM_TOKEN
+from config import (
+    OWNER_TELEGRAM_ID, TELEGRAM_TOKEN, MSG_UNAUTHORIZED,
+    FEATURE_FIND_MY_IPHONE, FEATURE_DEVICE_TRACKING,
+    FEATURE_LOCATION_HISTORY, FEATURE_NOTIFICATIONS
+)
 from logger import get_logger
 from utils import mask_email, validate_apple_password
 
@@ -65,11 +69,11 @@ def is_owner(uid: int) -> bool:
 async def guard(obj) -> bool:
     if isinstance(obj, Message):
         if not is_owner(obj.from_user.id):
-            await obj.answer("⛔ Доступ запрещён.")
+            await obj.answer(MSG_UNAUTHORIZED)
             return False
     elif isinstance(obj, CallbackQuery):
         if not is_owner(obj.from_user.id):
-            await obj.answer("⛔ Доступ запрещён.", show_alert=True)
+            await obj.answer(MSG_UNAUTHORIZED, show_alert=True)
             return False
     return True
 
@@ -397,7 +401,7 @@ async def cmd_login(m: Message):
             else:
                 await m.answer(f"❌ Ошибка входа: {r['error']}", reply_markup=main_kb())
                 if r.get("screenshot"):
-                    await m.answer_photo(BufferedInputFile(r["screenshot"], "error.png"), caption="Скриншот ошибки")
+                    await m.answer_photo(BufferedInputFile(r["screenshot"], "error.png"), caption="Скриншот ��шибки")
         except asyncio.TimeoutError:
             await m.answer("⏱ Таймаут входа. Попробуйте ещё раз.")
         finally:

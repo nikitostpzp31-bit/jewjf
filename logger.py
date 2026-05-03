@@ -6,7 +6,7 @@ from pathlib import Path
 
 from loguru import logger as _logger
 
-from config import LOG_PATH
+from config import LOG_PATH, LOG_LEVEL, LOG_FORMAT, LOG_MAX_SIZE, LOG_BACKUP_COUNT
 
 _configured = False
 
@@ -15,13 +15,14 @@ def _configure() -> None:
     if _configured:
         return
     _logger.remove()
-    _logger.add(sys.stdout, colorize=True, format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}")
+    _logger.add(sys.stdout, colorize=True, format=LOG_FORMAT, level=LOG_LEVEL)
     _logger.add(
         LOG_PATH,
-        rotation="10 MB",
-        retention="30 days",
+        rotation=f"{LOG_MAX_SIZE} bytes",
+        retention=LOG_BACKUP_COUNT,
         encoding="utf-8",
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}",
+        format=LOG_FORMAT,
+        level=LOG_LEVEL,
     )
     _configured = True
 
