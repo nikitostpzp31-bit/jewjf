@@ -1,0 +1,65 @@
+# iCloud Monitor Bot Configuration
+# =================================
+
+bot:
+  token: "${BOT_TOKEN}"
+  admin_id: "${ADMIN_ID}"
+  secret_phrase: "${SECRET_PHRASE}"
+
+security:
+  fernet_key: "${FERNET_KEY}"
+  encryption_enabled: true
+  max_login_attempts: 5
+  session_timeout: 3600
+
+database:
+  path: "data/bot.db"
+  backup_enabled: true
+  backup_interval: 86400
+
+scheduler:
+  check_interval: 300
+  notification_enabled: true
+  retry_attempts: 3
+  retry_delay: 60
+
+icloud:
+  enabled: true
+  use_playwright: true
+  fallback_selenium: true
+  headless: true
+  timeout: 30000
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+backup:
+  enabled: true
+  dropbox_enabled: false
+  google_drive_enabled: false
+  local_path: "backups/"
+  max_backups: 10
+
+analytics:
+  enabled: true
+  track_commands: true
+  track_errors: true
+  report_interval: 604800
+
+logging:
+  level: "INFO"
+  file: "logs/bot.log"
+  max_size: 10485760
+  backup_count: 5
+  format: "{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
+
+messages:
+  welcome: "Добро пожаловать в iCloud Monitor Bot!"
+  unauthorized: "Доступ запрещен. Введите секретную фразу."
+  verified: "Верификация пройдена успешно!"
+  error: "Произошла ошибка. Попробуйте позже."
+  
+features:
+  find_my_iphone: true
+  device_tracking: true
+  location_history: true
+  notifications: true
+  auto_backup: true
