@@ -14,12 +14,16 @@ def _configure() -> None:
     global _configured
     if _configured:
         return
+    
+    # Создаём директорию для логов, если её нет
+    Path(LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
+    
     _logger.remove()
     _logger.add(sys.stdout, colorize=True, format=LOG_FORMAT, level=LOG_LEVEL)
     _logger.add(
         LOG_PATH,
-        rotation=f"{LOG_MAX_SIZE} bytes",
-        retention=LOG_BACKUP_COUNT,
+        rotation=LOG_MAX_SIZE,  # Размер в байтах для ротации
+        retention=LOG_BACKUP_COUNT,  # Количество файлов для сохранения
         encoding="utf-8",
         format=LOG_FORMAT,
         level=LOG_LEVEL,
