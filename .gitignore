@@ -1,4 +1,4 @@
-__pycache__/
+pycache/
 *.pyc
 *.pyo
 bot.log
